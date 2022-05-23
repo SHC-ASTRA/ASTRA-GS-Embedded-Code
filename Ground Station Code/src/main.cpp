@@ -6,35 +6,7 @@
 #include <utility/imumaths.h>
 #include <EEPROM.h>
 #include <LoRa.h>
-
-Servo myServo;
-int minServoPos = 70;
-int maxServoPos = 110;
-
-#define GPSSerial Serial5
-Adafruit_GPS GPS(&GPSSerial);
-void setupAdafruitGPS();
-void publishGPSData();
-
-Adafruit_BNO055 bno = Adafruit_BNO055();
-
-#define RFM95_CS 10
-#define RFM95_RST 8
-#define RFM95_INT 9
-
-#define RF95_FREQ_LOW 905E6
-#define RF95_FREQ_MID 915E6
-#define RF95_FREQ_HIGH 925E6
-
-String outgoing;
-
-byte msgCount = 0;		  // count of outgoing messages
-byte localAddress = 0x69; // address of this device
-byte destination = 0x42;  // destination to send to
-long lastSendTime = 0;	  // last send time
-int interval = 2000;	  // interval between sends
-
-bool ignoreJetson = false;
+#include <MovingAverageAngle.h>
 
 struct dataPacket
 {
@@ -59,7 +31,7 @@ struct commandPacket
 	int left_rpm_command;
 	int right_rpm_command;
 	bool change_frequency;
-	char lora_frequency; 
+	char lora_frequency;
 	bool command_navigate;
 	float command_latitude;
 	float command_longitude;
@@ -68,16 +40,70 @@ struct commandPacket
 void parseCommand(String);
 void sendCommand(commandPacket);
 boolean onReceive(int, dataPacket *);
+float heading_error(float bearing, float current_heading);
+float wrap360(float direction);
+float bearing(float curr_lat, float curr_lon, float targ_lat, float targ_lon);
+void publishIMUData();
+void setupAdafruitGPS();
+void publishGPSData();
 
-unsigned long time = 0;
-unsigned long time2 = 0;
+Servo myServo;
+int minServoPos = 900;
+int maxServoPos = 2100;
+int servoPos = 1500;
+
+float targetHeading = 90;
+float imuToForwardOffset = 180;
+float magneticDeclinationOffset = -4; // CHANGE TO 10.25 BEFORE GOING TO HANKSVILLE!!!
+float currentHeading;
+float unfilteredHeading;
+unsigned long servoAdjustPeriod = 100;
+unsigned long lastServoAdjust = 0;
+float deadband = 2.5; // deadband is +/- this value
+bool doTracking = true;
+bool doPointing = true;
+float target_lat = 1;
+float target_lon = 0;
+float current_lat = 0;
+float current_lon = 0;
+
+MovingAverageAngle<128> headingFilter;
+
+#define GPSSerial Serial5
+Adafruit_GPS GPS(&GPSSerial);
+
+Adafruit_BNO055 bno = Adafruit_BNO055();
+uint8_t system_cal;
+uint8_t gyro_cal;
+uint8_t accel_cal;
+uint8_t mag_cal;
+long CalibrationVersion = 1;
+
+#define RFM95_CS 10
+#define RFM95_RST 8
+#define RFM95_INT 9
+
+#define RF95_FREQ_LOW 905E6
+#define RF95_FREQ_MID 915E6
+#define RF95_FREQ_HIGH 925E6
+
+String outgoing;
+
+byte msgCount = 0;		  // count of outgoing messages
+byte localAddress = 0x69; // address of this device
+byte destination = 0x42;  // destination to send to
+
+bool ignoreJetson = false;
+
+unsigned long lastImuCheck = 0;
 unsigned long gpsCount = 0;
+unsigned long lastImuPacket = 0;
 
 bool calibrated = false;
 
 void setup()
 {
-	Serial.begin(115200);
+	// Serial.begin(115200);
 	Serial1.begin(115200);
 
 	setupAdafruitGPS();
@@ -96,10 +122,8 @@ void setup()
 	EEPROM.get(eeAddress, bnoID);
 
 	adafruit_bno055_offsets_t calibrationData;
-	sensor_t sensor;
 
-	bno.getSensor(&sensor);
-	if (bnoID != sensor.sensor_id)
+	if (bnoID != CalibrationVersion)
 	{
 		Serial1.println("status;No Calibration Data for this sensor exists in EEPROM");
 		delay(500);
@@ -117,7 +141,7 @@ void setup()
 		calibrated = true;
 	}
 
-	bno.setExtCrystalUse(true);
+	// bno.setExtCrystalUse(true);
 
 	// override the default CS, reset, and IRQ pins (optional)
 	LoRa.setPins(RFM95_CS, RFM95_RST, RFM95_INT); // set CS, reset, IRQ pin
@@ -136,8 +160,8 @@ void setup()
 
 	Serial1.println("status;LoRa init succeeded.");
 
-	myServo.attach(3);
-	myServo.write((maxServoPos - minServoPos) / 2 + minServoPos);
+	myServo.attach(3, minServoPos, maxServoPos);
+	myServo.writeMicroseconds((maxServoPos - minServoPos) / 2 + minServoPos);
 	delay(1000);
 }
 
@@ -152,24 +176,29 @@ void loop()
 		if (gpsCount % 2 == 0)
 		{
 			publishGPSData();
+			current_lat = GPS.latitudeDegrees;
+			current_lon = GPS.longitudeDegrees;
+
+			if(doTracking)
+			{
+				targetHeading = bearing(current_lat,current_lon,target_lat,target_lon);
+			}
 		}
 	}
 
-	if (millis() > time2 + 250)
+	if (millis() > lastImuCheck + 10)
 	{
 		imu::Vector<3> vector = bno.getVector(Adafruit_BNO055::VECTOR_EULER);
 
-		// Serial1.print(vector.x());
-		// Serial1.print(", ");
-		// Serial1.print(vector.y());
-		// Serial1.print(", ");
-		// Serial1.println(vector.z());
+		unfilteredHeading = wrap360(vector.x() + (imuToForwardOffset + magneticDeclinationOffset));
+		headingFilter.add(unfilteredHeading);
 
-		uint8_t system_cal = 0;
-		uint8_t gyro_cal = 0;
-		uint8_t accel_cal = 0;
-		uint8_t mag_cal = 0;
+		system_cal = 0;
+		gyro_cal = 0;
+		accel_cal = 0;
+		mag_cal = 0;
 		bno.getCalibration(&system_cal, &gyro_cal, &accel_cal, &mag_cal);
+
 		// Serial1.print(system_cal);
 		// Serial1.print(", ");
 		// Serial1.print(gyro_cal);
@@ -186,27 +215,58 @@ void loop()
 				Serial1.println("status;Saving to EEPROM");
 				adafruit_bno055_offsets_t newCalib;
 				bno.getSensorOffsets(newCalib);
-				EEPROM.put(sizeof(long), newCalib);
 
 				int eeAddress = 0;
-				sensor_t sensor;
-				bno.getSensor(&sensor);
-				long bnoID = sensor.sensor_id;
 
-				EEPROM.put(eeAddress, bnoID);
+				EEPROM.put(eeAddress, CalibrationVersion);
 
 				eeAddress += sizeof(long);
 				EEPROM.put(eeAddress, newCalib);
-				Serial.println("status;Data stored to EEPROM.");
+				Serial1.println("status;Data stored to EEPROM.");
 				calibrated = true;
 			}
 		}
 
-		time2 = millis();
+		lastImuCheck = millis();
 	}
+
+	if (millis() > lastImuPacket + 1000)
+	{
+		lastImuPacket = millis();
+		publishIMUData();
+	}
+
+	
+
+	if (millis() > lastServoAdjust + servoAdjustPeriod && doPointing)
+	{
+		lastServoAdjust = millis();
+
+		currentHeading = headingFilter.get();
+		// Serial1.println(currentHeading);
+
+		float error = heading_error(targetHeading, currentHeading);
+		if ((servoPos < maxServoPos && error > 0) || (servoPos > minServoPos && error < 0))
+		{
+			// Serial1.print(servoPos);
+			// Serial1.println(" Adjusting servo");
+
+			float error = heading_error(targetHeading, currentHeading);
+			if (abs(error) > deadband)
+			{
+				int servoDelta = error > 0 ? 1 : -1;
+				servoPos += servoDelta;
+				myServo.writeMicroseconds(servoPos);
+			}
+		}
+	}
+
 	dataPacket myPacket;
 	if (onReceive(LoRa.parsePacket(), &myPacket))
 	{
+		target_lat = myPacket.latitude;
+		target_lon = myPacket.longitude;
+
 		Serial1.print("data_packet;");
 		Serial1.print("rover_latitude=");
 		Serial1.print(myPacket.latitude);
@@ -235,14 +295,6 @@ void loop()
 		Serial1.println(myPacket.right_wheels_rpm);
 	}
 
-	if (millis() > time + 10000)
-	{
-		// Serial.println("Teensy USB Serial");
-		// Serial1.println("Dongle Serial");
-
-		time = millis();
-	}
-
 	if (Serial1.available())
 	{
 		String command = Serial1.readStringUntil('\n');
@@ -253,7 +305,7 @@ void loop()
 void parseCommand(String command)
 {
 	String exec = command.substring(0, command.indexOf(';'));
-	
+
 	commandPacket packet;
 	packet.ignore_jetson = ignoreJetson;
 
@@ -265,7 +317,8 @@ void parseCommand(String command)
 		sendCommand(packet);
 
 		Serial1.println("status; sent halt command!");
-	} else if (exec.equals("ENABLE"))
+	}
+	else if (exec.equals("ENABLE"))
 	{
 		// command rover to listen to jetson commands
 		packet.ignore_jetson = false;
@@ -273,10 +326,11 @@ void parseCommand(String command)
 		sendCommand(packet);
 
 		Serial1.println("status; sent enable command!");
-	} else if (exec.equals("SET_FREQ"))
-	{		
+	}
+	else if (exec.equals("SET_FREQ"))
+	{
 		String freq = command.substring(exec.length() + 1, command.length());
-		
+
 		packet.change_frequency = true;
 
 		if (freq.equals("905"))
@@ -286,14 +340,16 @@ void parseCommand(String command)
 			delay(100);
 			LoRa.setFrequency(RF95_FREQ_LOW);
 			Serial1.println("status; changed frequency to 905E6");
-		} else if (freq.equals("915"))
+		}
+		else if (freq.equals("915"))
 		{
 			packet.lora_frequency = 'M';
 			sendCommand(packet);
 			delay(100);
 			LoRa.setFrequency(RF95_FREQ_MID);
 			Serial1.println("status; changed frequency to 915E6");
-		} else if (freq.equals("925"))
+		}
+		else if (freq.equals("925"))
 		{
 			packet.lora_frequency = 'H';
 			sendCommand(packet);
@@ -301,13 +357,53 @@ void parseCommand(String command)
 			LoRa.setFrequency(RF95_FREQ_HIGH);
 			Serial1.println("status; changed frequency to 925E6");
 		}
-
-	} else if (exec.equals("TRACKING_ENABLE"))
+	}
+	else if (exec.equals("TRACKING_ENABLE"))
 	{
-		// enable tracking
-	} else if (exec.equals("IGNORE_TRACKING"))
+		doTracking = true;
+		Serial1.println("status; enabled tracking");
+	}
+	else if (exec.equals("TRACKING_DISABLE"))
 	{
-		// ignore tracking
+		doTracking = false;
+		Serial1.println("status; disabled tracking");
+	}
+	else if (exec.equals("POINTING_ENABLE"))
+	{
+		doPointing = true;
+		Serial1.println("status; enabled pointing");
+	}
+	else if (exec.equals("POINTING_DISABLE"))
+	{
+		doPointing = false;
+		Serial1.println("status; disabled pointing");
+	}
+	else if (exec.equals("SET_DECLINATION"))
+	{
+		Serial1.print("status; changed declination from ");
+		Serial1.print(magneticDeclinationOffset);
+		magneticDeclinationOffset = command.substring(exec.length() + 1, command.length()).toFloat();
+		Serial1.print(" to ");
+		Serial1.println(magneticDeclinationOffset);
+	}
+	else if (exec.equals("MANUAL_HEADING"))
+	{
+		if (doTracking)
+		{
+			Serial1.println("warning; Automatic tracking was enabled, auto-disabling");
+			doTracking = false;
+		}
+		Serial1.print("status; changed target heading from ");
+		Serial1.print(targetHeading);
+		targetHeading = command.substring(exec.length() + 1, command.length()).toFloat();
+		targetHeading = wrap360(targetHeading);
+		Serial1.print(" to ");
+		Serial1.println(targetHeading);
+	}
+	else
+	{
+		Serial1.print("warning; unrecognized command string : ");
+		Serial1.println(command);
 	}
 }
 
@@ -348,23 +444,54 @@ void publishGPSData()
 
 	Serial1.print(F("."));
 	unsigned long millisecs = GPS.milliseconds; // Print the milliseconds
-	Serial.print(millisecs);
+	Serial1.print(millisecs);
 
 	Serial1.print(",gs_latitude=");
-	long latitude = GPS.latitudeDegrees; // Print the latitude
+	float latitude = GPS.latitudeDegrees; // Print the latitude
 	Serial1.print(latitude);
 
 	Serial1.print(",gs_longitude=");
-	long longitude = GPS.longitudeDegrees; // Print the longitude
+	float longitude = GPS.longitudeDegrees; // Print the longitude
 	Serial1.print(longitude);
 
-	long altitude = GPS.altitude; // Print the height above mean sea level
-	Serial1.print(",gs_altitude=");
+	float altitude = GPS.altitude;	// Print the height above mean sea level
+	Serial1.print(",gs_altitude="); // Do we need this?
 	Serial1.print(altitude);
 
 	long horizontal_accuracy = 3;
 	Serial1.print(",gs_horizontal_accuracy=");
 	Serial1.println(horizontal_accuracy);
+}
+
+void publishIMUData()
+{
+	Serial1.print("compass;");
+
+	Serial1.print("heading=");
+	Serial1.print(currentHeading);
+
+	Serial1.print(",target_heading=");
+	Serial1.print(targetHeading);
+
+	Serial1.print(",unfilt_heading=");
+	Serial1.print(unfilteredHeading);
+
+	Serial1.print(",system_cal=");
+	Serial1.print(system_cal);
+
+	Serial1.print(",accel_cal=");
+	Serial1.print(accel_cal);
+
+	Serial1.print(",gryo_cal=");
+	Serial1.print(gyro_cal);
+
+	Serial1.print(",mag_cal=");
+	Serial1.println(mag_cal);
+
+	if (system_cal == 0)
+	{
+		Serial1.println("warning;BNO055 system calibration reports no heading lock");
+	}
 }
 
 void sendCommand(commandPacket packet)
@@ -428,4 +555,39 @@ boolean onReceive(int packetSize, dataPacket *recvd_packet)
 	Serial1.println();
 
 	return true;
+}
+
+float heading_error(float bearing, float current_heading)
+{
+	float error = current_heading - bearing;
+	if (error > 180)
+		error -= 360;
+	if (error <= -180)
+		error += 360;
+	return error;
+}
+
+float wrap360(float direction)
+{
+	while (direction >= 360)
+		direction -= 360;
+	while (direction < 0)
+		direction += 360;
+	return direction;
+}
+
+float bearing(float curr_lat, float curr_lon, float targ_lat, float targ_lon)
+{
+
+	float theta1 = radians(curr_lat);
+	float theta2 = radians(targ_lat);
+	float delta2 = radians(targ_lon - curr_lon);
+
+	float y = sin(delta2) * cos(theta2);
+	float x = cos(theta1) * sin(theta2) - sin(theta1) * cos(theta2) * cos(delta2);
+	float bearing = atan2(y, x);
+	bearing = degrees(bearing); // radians to degrees
+	bearing = wrap360(bearing);
+
+	return bearing;
 }
