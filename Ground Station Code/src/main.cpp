@@ -7,6 +7,7 @@
 #include <EEPROM.h>
 #include <LoRa.h>
 #include <MovingAverageAngle.h>
+#include <MovingAverage.h>
 
 struct dataPacket
 {
@@ -68,6 +69,8 @@ float current_lat = 0;
 float current_lon = 0;
 
 MovingAverageAngle<128> headingFilter;
+MovingAverage<float_t, 16> gpsLatFilter;
+MovingAverage<float_t, 16> gpsLonFilter;
 
 #define GPSSerial Serial5
 Adafruit_GPS GPS(&GPSSerial);
@@ -176,8 +179,10 @@ void loop()
 		if (gpsCount % 2 == 0)
 		{
 			publishGPSData();
-			current_lat = GPS.latitudeDegrees;
-			current_lon = GPS.longitudeDegrees;
+			gpsLatFilter.add(GPS.latitudeDegrees);
+			gpsLonFilter.add(GPS.longitudeDegrees);
+			current_lat = gpsLatFilter.get();
+			current_lon = gpsLonFilter.get();
 
 			if(doTracking)
 			{
@@ -358,6 +363,14 @@ void parseCommand(String command)
 			Serial1.println("status; changed frequency to 925E6");
 		}
 	}
+	else if (exec.equals("MANUAL_GPS_TARGET_LAT"))
+	{
+		target_lat = command.substring(exec.length() + 1, command.length()).toFloat();
+	}
+	else if (exec.equals("MANUAL_GPS_TARGET_LON"))
+	{
+		target_lon = command.substring(exec.length() + 1, command.length()).toFloat();
+	}
 	else if (exec.equals("TRACKING_ENABLE"))
 	{
 		doTracking = true;
@@ -486,7 +499,10 @@ void publishIMUData()
 	Serial1.print(gyro_cal);
 
 	Serial1.print(",mag_cal=");
-	Serial1.println(mag_cal);
+	Serial1.print(mag_cal);
+
+	Serial1.print(",active_tracking=");
+	Serial1.println(doTracking);
 
 	if (system_cal == 0)
 	{
