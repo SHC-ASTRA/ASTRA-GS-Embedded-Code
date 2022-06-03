@@ -55,7 +55,7 @@ int servoPos = 1500;
 
 float targetHeading = 90;
 float imuToForwardOffset = 180;
-float magneticDeclinationOffset = -4; // CHANGE TO 10.25 BEFORE GOING TO HANKSVILLE!!!
+float magneticDeclinationOffset = 10.25; // CHANGE TO 10.25 BEFORE GOING TO HANKSVILLE!!!
 float currentHeading;
 float unfilteredHeading;
 unsigned long servoAdjustPeriod = 100;
@@ -65,12 +65,12 @@ bool doTracking = true;
 bool doPointing = true;
 float target_lat = 1;
 float target_lon = 0;
-float current_lat = 0;
-float current_lon = 0;
+float current_lat = 38.381332;
+float current_lon = -110.718854;
 
 MovingAverageAngle<128> headingFilter;
-MovingAverage<float_t, 16> gpsLatFilter;
-MovingAverage<float_t, 16> gpsLonFilter;
+// MovingAverage<float_t, 16> gpsLatFilter;
+// MovingAverage<float_t, 16> gpsLonFilter;
 
 #define GPSSerial Serial5
 Adafruit_GPS GPS(&GPSSerial);
@@ -179,10 +179,19 @@ void loop()
 		if (gpsCount % 2 == 0)
 		{
 			publishGPSData();
-			gpsLatFilter.add(GPS.latitudeDegrees);
-			gpsLonFilter.add(GPS.longitudeDegrees);
-			current_lat = gpsLatFilter.get();
-			current_lon = gpsLonFilter.get();
+			// gpsLatFilter.add(GPS.latitudeDegrees);
+			// gpsLonFilter.add(GPS.longitudeDegrees);
+			// current_lat = gpsLatFilter.get();
+			// current_lon = gpsLonFilter.get();
+
+			float new_current_lat = GPS.latitudeDegrees;
+			float new_current_lon = GPS.longitudeDegrees;
+
+			if (new_current_lat != 0 && new_current_lon != 0)
+			{
+				current_lat = new_current_lat;
+				current_lon = new_current_lon;
+			}
 
 			if(doTracking)
 			{
@@ -370,6 +379,14 @@ void parseCommand(String command)
 	else if (exec.equals("MANUAL_GPS_TARGET_LON"))
 	{
 		target_lon = command.substring(exec.length() + 1, command.length()).toFloat();
+	}
+	else if (exec.equals("MANUAL_GPS_BASE_LAT"))
+	{
+		current_lat = command.substring(exec.length() + 1, command.length()).toFloat();
+	}
+	else if (exec.equals("MANUAL_GPS_BASE_LON"))
+	{
+		current_lon = command.substring(exec.length() + 1, command.length()).toFloat();
 	}
 	else if (exec.equals("TRACKING_ENABLE"))
 	{
